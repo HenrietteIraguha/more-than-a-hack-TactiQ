@@ -1,4 +1,4 @@
-"""Our solution, version 1: who has the ball, frame by frame.
+"""Our solution, version 2: who has the ball, frame by frame.
 
 How we got here
 ---------------
@@ -39,9 +39,18 @@ each track's team, writing the answer file) and replaces the "nearest player + v
   3. Restart = the team of the player nearest the ball when it is played again (opponents must
      stand back at set pieces, so that player is the taker).
                                                  (the offside at 1:07, the ball given back at 3:28)
-  4. Sticky possession: keep the current team until the other team clearly takes over, either
-     by staying near the ball for half a second or by touching it when the ball turns or stops.
+  4. Sticky possession: keep the current team until the other team clearly takes over.
                                                  (0:07, 0:15, 0:18, 3:03, 4:04)
+
+Version 2 (13 November) brings in the best part of our teammate's baseline_plus.py:
+  * possession inside each stretch of live play is decided by a Viterbi decoder, where every
+    change of team has a cost, instead of version 1's frame-by-frame streak rule. Our whole-match
+    check (check_output.py) showed version 1 still made about a third of possessions shorter
+    than 3 seconds.
+  * the ball being clearly off the pitch is an extra dead-ball signal.
+We did not take two of its ideas: forcing a fixed block of frames to D (rules tied to specific
+frames of this match are not allowed) and merging every possession shorter than 2 seconds (the
+real match has possessions of about a second, like Barcelona's header at 3:03).
 
     pip install -r requirements.txt          # numpy and pandas, nothing else
     python starter/our_solution.py           # writes evaluation/results/our_team.csv
@@ -160,6 +169,28 @@ TOUCH_RADIUS_M = 3.0               # the touch goes to a team whose player is th
 TOUCH_CONFIRM_WINDOW = 12
 TOUCH_CONFIRM_FRAMES = 3
 MIN_MOVE_M = 0.15                  # ignore direction changes when the ball barely moves
+
+# Version 2: possession decoder (adapted from our teammate's baseline_plus.py).
+# Version 1's frame-by-frame "streak" rule still left about a third of all possessions shorter
+# than 3 seconds in our whole-match check: it switched teams too easily in duels and passes.
+# A Viterbi decoder looks at the whole stretch of play at once and picks the most likely
+# sequence of H and A, where every change of team has a cost. A handover then needs evidence
+# that holds up over time, and frames with no evidence (ball missing, nobody close) simply keep
+# the current team, which is the challenge's own rule for loose balls.
+DECODER = "viterbi"                # "viterbi" (version 2) or "streak" (version 1)
+CONTROL_RADIUS_M = 4.0             # only count the nearest player as evidence within 4 m
+EVIDENCE_SCALE_M = 2.0             # evidence grows with how much closer that team is, 2 m = 1 unit
+EVIDENCE_CAP = 3.0                 # and is capped, so one odd frame can't decide on its own
+# A team that is clearly closer (about 6 m) earns 3 units a frame, so a change of possession needs
+# about half a second of clear evidence, or around a second of weaker evidence. That is long
+# enough to ignore a defender pressing the carrier, and short enough to keep the real one-second
+# possessions we saw (Barcelona's header at 3:03).
+SWITCH_COST = 40.0
+
+# Ball off the pitch. By the laws of the game the ball is dead once it has wholly crossed a line,
+# so this is an extra dead-ball signal next to the players walking. 1 m of margin allows for the
+# tracking being slightly off near the lines.
+OUT_MARGIN_M = 1.0
 
 
 # ----------------------------------------------------------------------------------------------
@@ -298,7 +329,7 @@ def remove_static_tracks(players):
 # Rule 2: dead ball from the share of players walking
 # ----------------------------------------------------------------------------------------------
 
-def dead_ball_mask(players):
+def dead_ball_mask(players, off_pitch=None):
     """True on frames where play looks stopped: most players walking, smoothed over 1 s.
 
     We tried the ball first, but it was not reliable for stoppages: at the offside at 1:07 it
@@ -316,6 +347,9 @@ def dead_ball_mask(players):
     share = rolling_mean(share, DEAD_SMOOTH_FRAMES)
 
     dead = share >= DEAD_FRACTION
+    if off_pitch is not None:
+        # Version 2: the ball being clearly off the pitch also means the ball is dead.
+        dead = dead | off_pitch
     # Short bursts of movement inside a stoppage are not a restart.
     for start, stop in runs(~dead):
         if start > 0 and stop < len(dead) and stop - start < MIN_ALIVE_GAP_FRAMES:
@@ -391,7 +425,53 @@ def touch_frames(ball):
 # Putting it together for one half
 # ----------------------------------------------------------------------------------------------
 
-def label_half(ball, players, team_of_track):
+def ball_off_pitch(ball, pitch):
+    """True where the tracked ball is clearly outside the pitch lines."""
+    length, width = pitch
+    x, y, m = ball[:, 0], ball[:, 1], OUT_MARGIN_M
+    with np.errstate(invalid="ignore"):
+        return (x < -m) | (x > length + m) | (y < -m) | (y > width + m)
+
+
+def possession_evidence(ball, home_dist, away_dist):
+    """Per frame: positive favours home, negative favours away, 0 = no evidence.
+
+    Only counts when the ball is seen and someone is within CONTROL_RADIUS_M, and grows with how
+    much closer one team is than the other. A loose or contested ball gives no evidence.
+    """
+    known = ~np.isnan(ball[:, 0])
+    nearest = np.fmin(home_dist, away_dist)
+    diff = away_dist - home_dist
+    with np.errstate(invalid="ignore"):
+        usable = known & ~np.isnan(diff) & (nearest <= CONTROL_RADIUS_M)
+    return np.clip(np.where(usable, diff / EVIDENCE_SCALE_M, 0.0), -EVIDENCE_CAP, EVIDENCE_CAP)
+
+
+def viterbi_two_teams(evidence, start_team):
+    """Most likely H/A sequence for one stretch of live play.
+
+    Each frame scores +e/2 for home and -e/2 for away; every change of team costs SWITCH_COST.
+    Starting with the team that did not take the restart costs the same as one change.
+    """
+    n = len(evidence)
+    gain = np.stack([evidence / 2.0, -evidence / 2.0], axis=1)        # (n, 2): home, away
+    score = gain[0].copy()
+    if start_team in (HOME, AWAY):
+        score[1 - start_team] -= SWITCH_COST
+    back = np.zeros((n, 2), dtype=np.int8)
+    for t in range(1, n):
+        stay, swap = score, score[::-1] - SWITCH_COST
+        choose_swap = swap > stay
+        back[t] = np.where(choose_swap, [1, 0], [0, 1])
+        score = np.where(choose_swap, swap, stay) + gain[t]
+    path = np.empty(n, dtype=np.int8)
+    path[-1] = int(np.argmax(score))
+    for t in range(n - 1, 0, -1):
+        path[t - 1] = back[t, path[t]]
+    return path                                                         # 0 = home, 1 = away
+
+
+def label_half(ball, players, team_of_track, pitch=None):
     """Labels H / A / D for every frame of one half (arrays already cut to that half).
 
     Each half is labelled on its own so nothing runs across halftime. The second half's scored
@@ -403,7 +483,7 @@ def label_half(ball, players, team_of_track):
 
     players, n_static = remove_static_tracks(players)
     ball = fill_short_gaps(ball, BALL_GAP_FILL_FRAMES)
-    dead, _ = dead_ball_mask(players)
+    dead, _ = dead_ball_mask(players, ball_off_pitch(ball, pitch) if pitch else None)
 
     home_dist, away_dist = nearest_by_team(ball, players, team_of_track)
     near = team_near(home_dist, away_dist, NEAR_RADIUS_M, NEAR_MARGIN_M)
@@ -411,6 +491,7 @@ def label_half(ball, players, team_of_track):
     touches = set(touch_frames(ball))
     ball_v = velocity(ball, SPEED_LAG_FRAMES)
     ball_speed = np.hypot(ball_v[:, 0], ball_v[:, 1])
+    evidence = possession_evidence(ball, home_dist, away_dist)
 
     current = NOBODY
     n_switches = 0
@@ -439,6 +520,13 @@ def label_half(ball, players, team_of_track):
                 current = HOME if np.nanmean(h[both] - a[both]) <= 0 else AWAY
             else:
                 current = HOME
+
+        if DECODER == "viterbi":
+            path = viterbi_two_teams(evidence[start:stop], current)
+            labels[start:stop] = np.where(path == HOME, "H", "A")
+            n_switches += int(np.sum(np.diff(path) != 0))
+            current = int(path[-1])
+            continue
 
         streak_team, streak_start, streak_len = NOBODY, None, 0
         frame = start
@@ -566,7 +654,8 @@ def build(game=GAME, data_dir=None):
     labels = np.full(n_frames, "X", dtype="<U1")
     for half, first, last in half_video_blocks(game):
         stop = last + 1
-        half_labels, stats = label_half(ball[first:stop], players[first:stop], team_of_track)
+        half_labels, stats = label_half(ball[first:stop], players[first:stop], team_of_track,
+                                        GAMES[game]["pitch"])
         labels[first:stop] = half_labels
         print("half {}: H {:>6}  A {:>6}  D {:>6}   possessions {:>4}   touches {:>5}   "
               "fake-dot blocks removed {}   restarts {} (taker seen in {})".format(
@@ -591,11 +680,17 @@ if __name__ == "__main__":
                         help="switch only on the 'stays near' rule, not on ball touches")
     parser.add_argument("--min-dead", type=int, default=MIN_DEAD_FRAMES,
                         help="shortest stoppage we believe, in frames (25 = 1 second)")
+    parser.add_argument("--decoder", choices=["viterbi", "streak"], default=DECODER,
+                        help="viterbi = version 2 (default), streak = version 1")
+    parser.add_argument("--switch-cost", type=float, default=SWITCH_COST,
+                        help="cost of a change of possession in the viterbi decoder")
     parser.add_argument("--min-alive-gap", type=int, default=MIN_ALIVE_GAP_FRAMES,
                         help="shortest burst of play inside a stoppage that counts as a restart")
     args = parser.parse_args()
 
     MIN_DEAD_FRAMES = args.min_dead
+    DECODER = args.decoder
+    SWITCH_COST = args.switch_cost
     MIN_ALIVE_GAP_FRAMES = args.min_alive_gap
     DEAD_FRACTION = args.dead_fraction
     SWITCH_FRAMES = args.switch_frames
