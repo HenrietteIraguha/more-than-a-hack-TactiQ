@@ -1,4 +1,4 @@
-"""Our solution, version 2: who has the ball, frame by frame.
+"""Our solution, version 3: who has the ball, frame by frame.
 
 How we got here
 ---------------
@@ -48,7 +48,16 @@ Version 2 (13 November) brings in the best part of our teammate's baseline_plus.
     check (check_output.py) showed version 1 still made about a third of possessions shorter
     than 3 seconds.
   * the ball being clearly off the pitch is an extra dead-ball signal.
-We did not take two of its ideas: forcing a fixed block of frames to D (rules tied to specific
+Version 3 (14 November) adds three one-rule fixes, each with a football reason:
+  * a ball flying faster than anyone can run (10 m/s) gives no evidence, so a pass in flight
+    stays with the team that kicked it;
+  * too few tracked players means no live play (the scored frames before the second-half
+    kickoff begin while the teams are still in the tunnel);
+  * a ball clearly off the pitch for at least a second is dead however short the stoppage,
+    because the laws of the game make it dead the moment it crosses the line. Quick throw-ins
+    were invisible to the 5-second minimum before this.
+
+We did not take two of baseline_plus.py's ideas: forcing a fixed block of frames to D (rules tied to specific
 frames of this match are not allowed) and merging every possession shorter than 2 seconds (the
 real match has possessions of about a second, like Barcelona's header at 3:03).
 
@@ -191,6 +200,25 @@ SWITCH_COST = 40.0
 # so this is an extra dead-ball signal next to the players walking. 1 m of margin allows for the
 # tracking being slightly off near the lines.
 OUT_MARGIN_M = 1.0
+
+# Version 3 rules. Each can be switched off from the command line to compare.
+#
+# Fast ball: nobody can run as fast as a kicked ball travels (a sprint is about 9 m/s), so while
+# the ball moves faster than FLY_SPEED_MS it is a pass or shot in flight and whoever it passes
+# near does not control it. Those frames give no evidence, and the current team keeps the ball.
+FAST_BALL_RULE = True
+FLY_SPEED_MS = 10.0
+# Few players: live play never happens with only a handful of players on the pitch. Before the
+# second-half kickoff the scored frames begin while the teams are still coming back out, and
+# with too few tracked players the walking share cannot even be measured, so without this rule
+# those frames would count as play. Averaged over a second, like the walking share.
+FEW_PLAYERS_DEAD = True
+# Ball out: by the laws of the game the ball is dead the moment it wholly crosses the line, no
+# matter how quickly the throw-in follows. Sustained for OUT_MIN_FRAMES to ride out tracking
+# jitter near the lines, and exempt from the 5-second minimum that applies to walking-based
+# stoppages (a quick throw-in is a real stoppage of only a few seconds).
+OUT_DEAD_RULE = True
+OUT_MIN_FRAMES = 25                # 1 second
 
 
 # ----------------------------------------------------------------------------------------------
@@ -347,16 +375,32 @@ def dead_ball_mask(players, off_pitch=None):
     share = rolling_mean(share, DEAD_SMOOTH_FRAMES)
 
     dead = share >= DEAD_FRACTION
+
+    if FEW_PLAYERS_DEAD:
+        # Version 3: too few tracked players means no live play (e.g. the scored frames before
+        # the second-half kickoff, while the teams are still coming back out of the tunnel).
+        few = rolling_mean(counted.astype(np.float32), DEAD_SMOOTH_FRAMES) < MIN_PLAYERS_FOR_DEAD
+        dead = dead | few
+
+    out = np.zeros(len(dead), dtype=bool)
     if off_pitch is not None:
-        # Version 2: the ball being clearly off the pitch also means the ball is dead.
-        dead = dead | off_pitch
+        if OUT_DEAD_RULE:
+            # Version 3: the ball clearly off the pitch for at least a second is a dead ball,
+            # however short the stoppage (quick throw-ins).
+            for start, stop in runs(off_pitch):
+                if stop - start >= OUT_MIN_FRAMES:
+                    out[start:stop] = True
+            dead = dead | out
+        else:
+            # Version 2 behaviour: raw off-pitch frames, subject to the 5-second minimum.
+            dead = dead | off_pitch
     # Short bursts of movement inside a stoppage are not a restart.
     for start, stop in runs(~dead):
         if start > 0 and stop < len(dead) and stop - start < MIN_ALIVE_GAP_FRAMES:
             dead[start:stop] = True
-    # Very short "stoppages" are just a quiet moment in play.
+    # Very short "stoppages" are just a quiet moment in play -- unless the ball was out.
     for start, stop in runs(dead):
-        if stop - start < MIN_DEAD_FRAMES:
+        if stop - start < MIN_DEAD_FRAMES and not out[start:stop].any():
             dead[start:stop] = False
     return dead, share
 
@@ -433,18 +477,23 @@ def ball_off_pitch(ball, pitch):
         return (x < -m) | (x > length + m) | (y < -m) | (y > width + m)
 
 
-def possession_evidence(ball, home_dist, away_dist):
+def possession_evidence(ball, home_dist, away_dist, ball_speed=None):
     """Per frame: positive favours home, negative favours away, 0 = no evidence.
 
     Only counts when the ball is seen and someone is within CONTROL_RADIUS_M, and grows with how
-    much closer one team is than the other. A loose or contested ball gives no evidence.
+    much closer one team is than the other. A loose or contested ball gives no evidence, and
+    neither does a ball flying faster than anyone can run with it (version 3): in both cases
+    the decoder keeps the current team, the challenge's own rule for loose balls.
     """
     known = ~np.isnan(ball[:, 0])
     nearest = np.fmin(home_dist, away_dist)
     diff = away_dist - home_dist
     with np.errstate(invalid="ignore"):
         usable = known & ~np.isnan(diff) & (nearest <= CONTROL_RADIUS_M)
-    return np.clip(np.where(usable, diff / EVIDENCE_SCALE_M, 0.0), -EVIDENCE_CAP, EVIDENCE_CAP)
+        ev = np.clip(np.where(usable, diff / EVIDENCE_SCALE_M, 0.0), -EVIDENCE_CAP, EVIDENCE_CAP)
+        if ball_speed is not None and FAST_BALL_RULE:
+            ev = np.where(ball_speed > FLY_SPEED_MS, 0.0, ev)
+    return ev
 
 
 def viterbi_two_teams(evidence, start_team):
@@ -475,8 +524,9 @@ def label_half(ball, players, team_of_track, pitch=None):
     """Labels H / A / D for every frame of one half (arrays already cut to that half).
 
     Each half is labelled on its own so nothing runs across halftime. The second half's scored
-    frames start almost two minutes before its kickoff. Those frames are all dead ball, and the
-    walking rule should catch them because everyone is standing in position waiting.
+    frames start almost two minutes before its kickoff. Those frames are all dead ball: the
+    walking rule catches them once players are out and standing, and the few-players rule
+    (version 3) catches them while the teams are still coming back out of the tunnel.
     """
     n = len(ball)
     labels = np.full(n, "D", dtype="<U1")
@@ -491,7 +541,7 @@ def label_half(ball, players, team_of_track, pitch=None):
     touches = set(touch_frames(ball))
     ball_v = velocity(ball, SPEED_LAG_FRAMES)
     ball_speed = np.hypot(ball_v[:, 0], ball_v[:, 1])
-    evidence = possession_evidence(ball, home_dist, away_dist)
+    evidence = possession_evidence(ball, home_dist, away_dist, ball_speed)
 
     current = NOBODY
     n_switches = 0
@@ -686,9 +736,18 @@ if __name__ == "__main__":
                         help="cost of a change of possession in the viterbi decoder")
     parser.add_argument("--min-alive-gap", type=int, default=MIN_ALIVE_GAP_FRAMES,
                         help="shortest burst of play inside a stoppage that counts as a restart")
+    parser.add_argument("--no-fast-ball", action="store_true",
+                        help="version 2 behaviour: a flying ball still gives evidence")
+    parser.add_argument("--no-few-dead", action="store_true",
+                        help="version 2 behaviour: few tracked players does not mean dead ball")
+    parser.add_argument("--no-out-dead", action="store_true",
+                        help="version 2 behaviour: ball out of pitch subject to the 5 s minimum")
     args = parser.parse_args()
 
     MIN_DEAD_FRAMES = args.min_dead
+    FAST_BALL_RULE = not args.no_fast_ball
+    FEW_PLAYERS_DEAD = not args.no_few_dead
+    OUT_DEAD_RULE = not args.no_out_dead
     DECODER = args.decoder
     SWITCH_COST = args.switch_cost
     MIN_ALIVE_GAP_FRAMES = args.min_alive_gap
