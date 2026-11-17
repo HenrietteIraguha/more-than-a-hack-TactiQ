@@ -77,7 +77,7 @@ TOUCH_CONFIRM_WINDOW = 12
 TOUCH_CONFIRM_FRAMES = 3
 MIN_MOVE_M = 0.15                  # ignore direction changes when the ball barely moves
 
-DECODER = "viterbi"                # "viterbi" (version 2) or "streak" (version 1)
+DECODER = "viterbi"                # "viterbi" (whole stretch at once) or "streak" (frame by frame)
 CONTROL_RADIUS_M = 4.0             # only count the nearest player as evidence within 4 m
 EVIDENCE_SCALE_M = 2.0             # evidence grows with how much closer that team is, 2 m = 1 unit
 EVIDENCE_CAP = 3.0                 # and is capped, so one odd frame can't decide on its own
@@ -108,13 +108,13 @@ TAG_NOT_A_TEAM = {"", "na", "n", "none", "null", "unknown", "both", "neither"}
 TAG_MIN_PARTIAL_CHARS = 4          # shorter than this must match a club name exactly
 
 TAG_RESTART = True
-TAG_FILL_ONLY = False              # True = only use the tags where version 3 found no taker
+TAG_FILL_ONLY = False              # True = use the tags only where the ball rule found no taker
 TAG_WINDOW_FRAMES = 50             # 2 seconds
 TAG_MAJORITY = 0.6                 # the winning team needs this share of the votes, else skip
 
 
 # ----------------------------------------------------------------------------------------------
-# Version 6: who the Smart Tagging phases say has the ball, as per-frame votes
+# Who the Smart Tagging phases say has the ball, as per-frame votes
 # ----------------------------------------------------------------------------------------------
 
 def side_from_team_name(value, home_name, away_name):
@@ -706,23 +706,23 @@ if __name__ == "__main__":
     parser.add_argument("--min-dead", type=int, default=MIN_DEAD_FRAMES,
                         help="shortest stoppage we believe, in frames (25 = 1 second)")
     parser.add_argument("--decoder", choices=["viterbi", "streak"], default=DECODER,
-                        help="viterbi = version 2 (default), streak = version 1")
+                        help="viterbi = whole stretch at once (default), streak = frame by frame")
     parser.add_argument("--switch-cost", type=float, default=SWITCH_COST,
                         help="cost of a change of possession in the viterbi decoder")
     parser.add_argument("--min-alive-gap", type=int, default=MIN_ALIVE_GAP_FRAMES,
                         help="shortest burst of play inside a stoppage that counts as a restart")
     parser.add_argument("--no-fast-ball", action="store_true",
-                        help="version 2 behaviour: a flying ball still gives evidence")
+                        help="a flying ball still gives evidence instead of none")
     parser.add_argument("--no-few-dead", action="store_true",
-                        help="version 2 behaviour: few tracked players does not mean dead ball")
+                        help="few tracked players does not mean dead ball")
     parser.add_argument("--no-out-dead", action="store_true",
-                        help="version 2 behaviour: ball out of pitch subject to the 5 s minimum")
+                        help="ball out of pitch subject to the 5 s minimum")
     parser.add_argument("--no-merge-stoppages", action="store_true",
                         help="do not rub out stoppages the ball was clearly played through")
     parser.add_argument("--busy-fraction", type=float, default=BALL_BUSY_FRACTION,
                         help="share of a stoppage the ball must be in play through to rub it out")
     parser.add_argument("--no-tag-restart", action="store_true",
-                        help="version 3 behaviour: work the restarting team out from the dots only")
+                        help="work the restarting team out from the dots only, ignoring the tags")
     parser.add_argument("--tag-fill-only", action="store_true",
                         help="use the dots first and the tags only where the kick was not found")
     parser.add_argument("--tag-window", type=int, default=TAG_WINDOW_FRAMES,
