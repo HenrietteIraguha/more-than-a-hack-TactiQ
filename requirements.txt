@@ -1,10 +1,21 @@
-# Everything the evaluation needs. Deliberately two lines.
+# Pinned for TactiQ's submission. SUBMISSION.md asks for pinned dependencies so that a
+# fresh clone reproduces evaluation/results/TactiQ.csv exactly rather than approximately.
 #
+# These are the versions we built and ran against:
+#   Python 3.12.1, numpy 2.5.4, pandas 3.1.0
+#
+# numpy  -- used by starter/our_solution.py
+# pandas -- used by starter/check_output.py and evaluation/validate_submission.py
+#
+# The original file was deliberately unpinned; the organisers' note is kept below.
+
+numpy==2.5.4
+pandas==3.1.0
+
+# --- organisers' original note -------------------------------------------------------------
 # The scorer is dependency-light on purpose: no sklearn, no torch, nothing that pins a Python
 # version. It runs under 3.8 and 3.11 alike and produces identical output, so "it scored
 # differently on my machine" is not a conversation anyone has to have.
 #
 # Optional tooling -- the ATD loader and anything that opens the video -- lives in
 # requirements-starter.txt.
-numpy
-pandas
