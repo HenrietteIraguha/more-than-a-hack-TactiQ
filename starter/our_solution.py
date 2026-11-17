@@ -1,79 +1,24 @@
-"""Our solution, version 3: who has the ball, frame by frame.
+"""TactiQ -- who has the ball, frame by frame.
 
-How we got here
----------------
-We started from the organisers' baseline (starter/baseline.py): give the ball to whoever is
-nearest to it, then smooth with a majority vote. Before changing anything we studied the first
-five minutes of the match three ways at once: the tactical video, the tracking data in
-notebook 02 (with our own helper tools for distances, ball speed and player speed), and the
-public answer key. We wrote down what happened at every change of possession and every
-stoppage, and compared it with what the data showed. Each rule below comes from something we
-saw there. The notes say which moment taught us what.
+    pip install -r requirements.txt
+    python starter/our_solution.py     # writes evaluation/results/TactiQ.csv
+    python starter/check_output.py     # our own check, no ground truth involved
 
-What we learned, in short
--------------------------
-* "Nearest player has the ball" is often wrong. At the 0:07 interception the Barcelona player
-  who won the ball was never the nearest dot; an Athletic player stayed closer the whole time.
-  During passes the ball rolls past opponents who never control it, and in tight duels a
-  defender pressing the carrier is just as close as the carrier.
-* The ball tells you when someone touches it. A pass travels fast and straight; a touch makes
-  it suddenly slow down or change direction. That showed the 0:07 interception clearly when
-  the player distances did not.
-* Stoppages show up in the players, not the ball. Offsides and fouls stop play with the ball
-  still on the pitch, and the ball often disappears from the tracking during a stoppage. What
-  was there every time was the players: within about a second of the whistle almost everyone
-  slows to a walk, and that is when the answer key starts its dead ball.
-* The answer key changes possession at the first clear touch by the other team: an
-  interception, a header won, a block. A player receiving a ball that is already rolling to him
-  only counts once he plays it on.
-* The tracking has fake dots: at least one track stands perfectly still beside Barcelona's goal,
-  in the same spot before kickoff and during play. It must not count as a player.
+One label per video frame for all 199,319 frames: H (Barcelona), A (Atletic Club), D (dead ball),
+X (outside the two graded blocks). Input is the automatic tracking data and the Smart Tagging.
 
-What this version does
-----------------------
-It keeps everything in the baseline that already works (reading the tracking file, knowing
-each track's team, writing the answer file) and replaces the "nearest player + vote" logic:
+  1. read the tracking: ball and 46 player tracks, in metres
+  2. drop tracks that never move -- objects beside the goal, not players
+  3. fill gaps in the ball shorter than half a second
+  4. dead ball from the players: three in four walking, too few tracked, or ball over a line
+  5. who restarts: the Smart Tagging phase tags, else the player nearest the ball when it moves
+  6. possession inside each stretch of play: a Viterbi decoder with a cost per change of hands
+  7. rub out stoppages the ball was clearly played through -- a final pass that can only turn a
+     D into a team, never the other way round, so nothing decided in step 6 can move
 
-  1. Drop tracks that do not move.               (the fake dots by the goal)
-  2. Dead ball = most players walking.           (the stoppages at 1:07, 3:08, 4:08, 4:34)
-  3. Restart = the team of the player nearest the ball when it is played again (opponents must
-     stand back at set pieces, so that player is the taker).
-                                                 (the offside at 1:07, the ball given back at 3:28)
-  4. Sticky possession: keep the current team until the other team clearly takes over.
-                                                 (0:07, 0:15, 0:18, 3:03, 4:04)
-
-Version 2 (13 November) brings in the best part of our teammate's baseline_plus.py:
-  * possession inside each stretch of live play is decided by a Viterbi decoder, where every
-    change of team has a cost, instead of version 1's frame-by-frame streak rule. Our whole-match
-    check (check_output.py) showed version 1 still made about a third of possessions shorter
-    than 3 seconds.
-  * the ball being clearly off the pitch is an extra dead-ball signal.
-Version 3 (14 November) adds three one-rule fixes, each with a football reason:
-  * a ball flying faster than anyone can run (10 m/s) gives no evidence, so a pass in flight
-    stays with the team that kicked it;
-  * too few tracked players means no live play (the scored frames before the second-half
-    kickoff begin while the teams are still in the tunnel);
-  * a ball clearly off the pitch for at least a second is dead however short the stoppage,
-    because the laws of the game make it dead the moment it crosses the line. Quick throw-ins
-    were invisible to the 5-second minimum before this.
-
-We did not take two of baseline_plus.py's ideas: forcing a fixed block of frames to D (rules tied to specific
-frames of this match are not allowed) and merging every possession shorter than 2 seconds (the
-real match has possessions of about a second, like Barcelona's header at 3:03).
-
-    pip install -r requirements.txt          # numpy and pandas, nothing else
-    python starter/our_solution.py           # writes evaluation/results/our_team.csv
-    python evaluation/run_evaluation.py      # score it
-
-Every number we might want to tune is in the PARAMETERS block below, and the most important
-ones can also be changed from the command line without editing this file, for example:
-
-    python starter/our_solution.py --dead-fraction 0.7 --name our_team_df70
-
-The public five minutes are used only to check that the program works and to understand what
-the labels mean (as CHALLENGE.md suggests). Settings are chosen from how football works and
-from what we saw, not from scores on those five minutes, which RULES.md does not allow. No hand
-labels on this match are used anywhere in the program.
+Why each rule is there, which assets we used and dropped, and where it fails are in the technical
+document. The SET PIECES tags are deliberately never read here: check_output.py marks our work
+with them, so the two must not share a source.
 """
 
 import argparse
@@ -90,6 +35,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, HERE)
 from games import GAME, GAMES, half_video_blocks, require, source_frames  # noqa: E402
 from baseline import HOME, AWAY, team_names, team_of_each_track, write_submission  # noqa: E402
+import load_smart_tagging  # noqa: E402
 
 RESULTS_DIR = os.path.join(ROOT, "evaluation", "results")
 FPS = 25
@@ -99,126 +45,147 @@ NOBODY = -1
 # PARAMETERS
 # ----------------------------------------------------------------------------------------------
 
-# Rule 1: fake dots.
-# At kickoff we counted about 10 dots per team, and one "Athletic" dot was standing inside
-# Barcelona's six-yard box. It was in exactly the same place minutes before kickoff and did not
-# move during the first seconds of play either. Real players never stand still that long, so a
-# track that stays inside a 1 m box for a whole 25-second block is treated as an object, not a
-# player, for that block. Otherwise it could be picked as "nearest to the ball" whenever play
-# reaches that goal.
 STATIC_BLOCK_FRAMES = 625          # 25 seconds
 STATIC_MAX_SPAN_M = 1.0
 
-# The ball is missing from the tracking on about 4 frames in 10 over the match (far more than in
-# the first five minutes). Gaps shorter than this are filled with a straight line between the two
-# known positions; longer gaps stay empty and the current team simply keeps the ball.
 BALL_GAP_FILL_FRAMES = 12          # about half a second
 
-# Speeds are measured over +/- this many frames.
 SPEED_LAG_FRAMES = 2
 
-# Rule 2: dead ball.
-# In every stoppage we watched, players eased off to a walk within about a second of the whistle,
-# and the answer key's dead ball started right then. In calm passing play a quarter to a third of
-# the players are walking too, so the bar has to be high to avoid calling a slow build-up a
-# stoppage.
 WALK_SPEED_MS = 2.0                # slower than this counts as walking or standing
 DEAD_FRACTION = 0.75               # this share of players walking means play has stopped
 DEAD_SMOOTH_FRAMES = 25            # average the walking share over 1 second
 MIN_PLAYERS_FOR_DEAD = 8           # need at least this many tracked players to decide
-# A real stoppage takes time: the ball has to be fetched, placed or thrown back in before play
-# restarts, so throw-ins, free kicks, goal kicks and corners take several seconds at least.
-# A short spell where most players happen to be walking is far more likely to be calm passing,
-# and calling it a stoppage would cut one possession into two. So a "stoppage" shorter than
-# 5 seconds is treated as play.
 MIN_DEAD_FRAMES = 125              # 5 seconds
-# From 3:09 to 3:28 the ball moved around while play was still dead: Barcelona's goalkeeper threw
-# it out and a Barcelona player handed it back to Athletic. A short burst of movement inside a
-# stoppage is therefore not a restart.
 MIN_ALIVE_GAP_FRAMES = 25
 
-# Rule 3: restart.
-# Who restarts can't be guessed from "who touched it last". After the offside at 1:07 the
-# Athletic player was still standing by the ball but Barcelona took the free kick, and at 3:28
-# Athletic restarted only because Barcelona gave the ball back.
-#
-# Version 1 gave the restart to the team most often near the ball in the first seconds of play.
-# Our check against the Smart Tagging showed that was right only about half the time: after a
-# goal kick or a corner the ball lands in a crowd, and the other team is often closer to it.
-#
-# The laws of the game give a better rule. At a free kick, corner or goal kick, opponents must
-# stand at least 9.15 m from the ball, and at a throw-in at least 2 m. So at the moment the ball
-# is played, the player nearest to it is the taker. We find the first moment the ball starts
-# moving around the restart, and give the ball to the team of the nearest player just before.
 RESTART_LOOKBACK_FRAMES = 50       # the stoppage often ends a little late, so start 2 s earlier
 RESTART_SEARCH_FRAMES = 75         # and look up to 3 seconds into play
 KICK_SPEED_MS = 3.0                # the ball moving faster than this = it has been played
 STILL_SPEED_MS = 2.0               # ...and it was slower than this just before (a set ball)
 KICK_RADIUS_M = 4.0                # the taker must be at least this close to the ball
 
-# Rule 4: possession.
-# "Near the ball" means within NEAR_RADIUS_M and clearly closer than the other team. The other
-# team only takes over if it stays near the ball for about half a second, which removes most of
-# the flickering that made the raw baseline invent many times more possessions than the match had.
 NEAR_RADIUS_M = 2.5
 NEAR_MARGIN_M = 0.5
 SWITCH_FRAMES = 12                 # about half a second
 
-# Touches. Before the 0:07 interception the ball travelled fast and almost perfectly straight;
-# at the interception it slowed down sharply and turned. That is how a touch looks in the data,
-# and it is also when the answer key switches: Barcelona's header at 3:03 and the pass cut out
-# between two Barcelona players at 4:04 both counted as Barcelona possession straight away.
 TOUCH_TURN_DEG = 40.0              # the ball turning more than this means someone touched it
 TOUCH_SPEED_CHANGE_MS = 4.0        # ...or its speed jumping or dropping by more than this
 TOUCH_WINDOW_FRAMES = 3            # compare the ball's movement 3 frames before and 3 after
 TOUCH_RADIUS_M = 3.0               # the touch goes to a team whose player is this close
-# At 0:08 the Barcelona player who intercepted had two Athletic players pressed right against
-# him, moving the same way. A pressing defender is as close as the carrier, so a touch only
-# switches possession if the touching team then stays near the ball for a few frames.
 TOUCH_CONFIRM_WINDOW = 12
 TOUCH_CONFIRM_FRAMES = 3
 MIN_MOVE_M = 0.15                  # ignore direction changes when the ball barely moves
 
-# Version 2: possession decoder (adapted from our teammate's baseline_plus.py).
-# Version 1's frame-by-frame "streak" rule still left about a third of all possessions shorter
-# than 3 seconds in our whole-match check: it switched teams too easily in duels and passes.
-# A Viterbi decoder looks at the whole stretch of play at once and picks the most likely
-# sequence of H and A, where every change of team has a cost. A handover then needs evidence
-# that holds up over time, and frames with no evidence (ball missing, nobody close) simply keep
-# the current team, which is the challenge's own rule for loose balls.
 DECODER = "viterbi"                # "viterbi" (version 2) or "streak" (version 1)
 CONTROL_RADIUS_M = 4.0             # only count the nearest player as evidence within 4 m
 EVIDENCE_SCALE_M = 2.0             # evidence grows with how much closer that team is, 2 m = 1 unit
 EVIDENCE_CAP = 3.0                 # and is capped, so one odd frame can't decide on its own
-# A team that is clearly closer (about 6 m) earns 3 units a frame, so a change of possession needs
-# about half a second of clear evidence, or around a second of weaker evidence. That is long
-# enough to ignore a defender pressing the carrier, and short enough to keep the real one-second
-# possessions we saw (Barcelona's header at 3:03).
 SWITCH_COST = 40.0
 
-# Ball off the pitch. By the laws of the game the ball is dead once it has wholly crossed a line,
-# so this is an extra dead-ball signal next to the players walking. 1 m of margin allows for the
-# tracking being slightly off near the lines.
 OUT_MARGIN_M = 1.0
 
-# Version 3 rules. Each can be switched off from the command line to compare.
-#
-# Fast ball: nobody can run as fast as a kicked ball travels (a sprint is about 9 m/s), so while
-# the ball moves faster than FLY_SPEED_MS it is a pass or shot in flight and whoever it passes
-# near does not control it. Those frames give no evidence, and the current team keeps the ball.
 FAST_BALL_RULE = True
 FLY_SPEED_MS = 10.0
-# Few players: live play never happens with only a handful of players on the pitch. Before the
-# second-half kickoff the scored frames begin while the teams are still coming back out, and
-# with too few tracked players the walking share cannot even be measured, so without this rule
-# those frames would count as play. Averaged over a second, like the walking share.
 FEW_PLAYERS_DEAD = True
-# Ball out: by the laws of the game the ball is dead the moment it wholly crosses the line, no
-# matter how quickly the throw-in follows. Sustained for OUT_MIN_FRAMES to ride out tracking
-# jitter near the lines, and exempt from the 5-second minimum that applies to walking-based
-# stoppages (a quick throw-in is a real stoppage of only a few seconds).
 OUT_DEAD_RULE = True
 OUT_MIN_FRAMES = 25                # 1 second
+
+MERGE_STOPPAGES = True
+BALL_BUSY_FRACTION = 0.5           # share of a stoppage the ball must be in play through
+
+TAG_IN_POSSESSION = {
+    "build up", "progression", "creating chances", "attacking transition", "long ball",
+    "ball in final third", "ball in the box", "players in the box", "goals",
+}
+TAG_OUT_OF_POSSESSION = {
+    "defending in attacking third", "defending in middle third", "defending in defensive third",
+    "defensive transition",
+}
+TAG_RESERVED_FOR_CHECKING = {"set pieces"}
+
+TAG_NOT_A_TEAM = {"", "na", "n", "none", "null", "unknown", "both", "neither"}
+TAG_MIN_PARTIAL_CHARS = 4          # shorter than this must match a club name exactly
+
+TAG_RESTART = True
+TAG_FILL_ONLY = False              # True = only use the tags where version 3 found no taker
+TAG_WINDOW_FRAMES = 50             # 2 seconds
+TAG_MAJORITY = 0.6                 # the winning team needs this share of the votes, else skip
+
+
+# ----------------------------------------------------------------------------------------------
+# Version 6: who the Smart Tagging phases say has the ball, as per-frame votes
+# ----------------------------------------------------------------------------------------------
+
+def side_from_team_name(value, home_name, away_name):
+    """Smart Tagging Team value -> HOME / AWAY / None, matched against the ATD metadata names."""
+    def plain(text):
+        return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+    tag, home, away = plain(value), plain(home_name), plain(away_name)
+    if not tag or tag in TAG_NOT_A_TEAM:
+        return None
+    if tag == home:
+        return HOME
+    if tag == away:
+        return AWAY
+    if len(tag) < TAG_MIN_PARTIAL_CHARS:
+        return None
+    home_like = tag in home or home in tag
+    away_like = tag in away or away in tag
+    if home_like and not away_like:
+        return HOME
+    if away_like and not home_like:
+        return AWAY
+    return None                                     # ambiguous: do not guess
+
+
+def phase_possession_votes(n_frames, home_name, away_name, game=GAME, data_dir=None):
+    """(n, 2) int16 of votes per frame: column HOME and column AWAY."""
+    votes = np.zeros((n_frames, 2), dtype=np.int16)
+    used, skipped_code, skipped_team, reserved = 0, {}, 0, 0
+
+    for event in load_smart_tagging.load(game, data_dir):
+        code = (event["code"] or "").strip().lower()
+        if code in TAG_RESERVED_FOR_CHECKING:
+            reserved += 1
+            continue
+        if code in TAG_IN_POSSESSION:
+            flip = False
+        elif code in TAG_OUT_OF_POSSESSION:
+            flip = True
+        else:
+            skipped_code[code] = skipped_code.get(code, 0) + 1
+            continue
+
+        side = side_from_team_name(event["tags"].get("Team"), home_name, away_name)
+        if side is None:
+            skipped_team += 1
+            continue
+        if flip:
+            side = AWAY if side == HOME else HOME
+
+        start = max(0, int(event["start_frame"]))
+        stop = min(n_frames, int(event["end_frame"]))
+        if stop > start:
+            votes[start:stop, side] += 1
+            used += 1
+
+    return votes, {"used": used, "reserved": reserved, "no_team": skipped_team,
+                   "unknown_codes": skipped_code}
+
+
+def restart_team_from_tags(start, stop, votes):
+    """Team the phases say has the ball in the first seconds after a restart, or NOBODY."""
+    high = min(stop, start + TAG_WINDOW_FRAMES)
+    if high <= start:
+        return NOBODY
+    home = int(votes[start:high, HOME].sum())
+    away = int(votes[start:high, AWAY].sum())
+    total = home + away
+    if total == 0 or max(home, away) < TAG_MAJORITY * total:
+        return NOBODY                               # no tags, or the phases disagree
+    return HOME if home > away else AWAY
 
 
 # ----------------------------------------------------------------------------------------------
@@ -226,11 +193,7 @@ OUT_MIN_FRAMES = 25                # 1 second
 # ----------------------------------------------------------------------------------------------
 
 def load_tracking(raw_path, n_frames, n_tracks, pitch):
-    """Return ball (n, 2) and players (n, tracks, 2), in metres, NaN where missing.
-
-    Same file format the baseline reads: "<frame_id>:<player>;<player>;...:<ball>", each group
-    "x,y,speed". frame_id counts from 1, our rows from 0, so row = frame_id - 1.
-    """
+    """Return ball (n, 2) and players (n, tracks, 2), in metres, NaN where missing."""
     length, width = pitch
     ball = np.full((n_frames, 2), np.nan, dtype=np.float32)
     players = np.full((n_frames, n_tracks, 2), np.nan, dtype=np.float32)
@@ -255,7 +218,6 @@ def load_tracking(raw_path, n_frames, n_tracks, pitch):
             groups = parts[1].split(";")
             values = parts[1].replace(";", ",").split(",")
             if len(values) == 3 * len(groups):
-                # Fast path: every group has exactly x,y,speed.
                 block = np.array(values, dtype=np.float64).reshape(-1, 3)[:n_tracks, :2]
                 players[row, :len(block), 0] = block[:, 0] * length
                 players[row, :len(block), 1] = block[:, 1] * width
@@ -328,11 +290,7 @@ def fill_short_gaps(series, max_gap):
 # ----------------------------------------------------------------------------------------------
 
 def remove_static_tracks(players):
-    """Copy of players with tracks blanked out on 25-second blocks where they did not move.
-
-    These are the fake dots we found beside Barcelona's goal: tracked like players, but standing
-    in exactly the same spot before kickoff and during play.
-    """
+    """Copy of players with tracks blanked out on 25-second blocks where they did not move."""
     n, n_tracks, _ = players.shape
     block = STATIC_BLOCK_FRAMES
     n_blocks = int(math.ceil(n / float(block)))
@@ -358,12 +316,7 @@ def remove_static_tracks(players):
 # ----------------------------------------------------------------------------------------------
 
 def dead_ball_mask(players, off_pitch=None):
-    """True on frames where play looks stopped: most players walking, smoothed over 1 s.
-
-    We tried the ball first, but it was not reliable for stoppages: at the offside at 1:07 it
-    stayed on the pitch and then went missing, and while it was being handed back at 3:09 it
-    was moving even though play was dead. The players were the clear signal every time.
-    """
+    """True on frames where play looks stopped: most players walking, smoothed over 1 s."""
     player_velocity = velocity(players, SPEED_LAG_FRAMES)
     speed = np.hypot(player_velocity[..., 0], player_velocity[..., 1])  # (n, tracks)
     measured = ~np.isnan(speed)
@@ -377,28 +330,21 @@ def dead_ball_mask(players, off_pitch=None):
     dead = share >= DEAD_FRACTION
 
     if FEW_PLAYERS_DEAD:
-        # Version 3: too few tracked players means no live play (e.g. the scored frames before
-        # the second-half kickoff, while the teams are still coming back out of the tunnel).
         few = rolling_mean(counted.astype(np.float32), DEAD_SMOOTH_FRAMES) < MIN_PLAYERS_FOR_DEAD
         dead = dead | few
 
     out = np.zeros(len(dead), dtype=bool)
     if off_pitch is not None:
         if OUT_DEAD_RULE:
-            # Version 3: the ball clearly off the pitch for at least a second is a dead ball,
-            # however short the stoppage (quick throw-ins).
             for start, stop in runs(off_pitch):
                 if stop - start >= OUT_MIN_FRAMES:
                     out[start:stop] = True
             dead = dead | out
         else:
-            # Version 2 behaviour: raw off-pitch frames, subject to the 5-second minimum.
             dead = dead | off_pitch
-    # Short bursts of movement inside a stoppage are not a restart.
     for start, stop in runs(~dead):
         if start > 0 and stop < len(dead) and stop - start < MIN_ALIVE_GAP_FRAMES:
             dead[start:stop] = True
-    # Very short "stoppages" are just a quiet moment in play -- unless the ball was out.
     for start, stop in runs(dead):
         if stop - start < MIN_DEAD_FRAMES and not out[start:stop].any():
             dead[start:stop] = False
@@ -435,12 +381,7 @@ def team_near(home_dist, away_dist, radius, margin):
 # ----------------------------------------------------------------------------------------------
 
 def touch_frames(ball):
-    """Frames where the ball suddenly turns or changes speed: someone probably touched it.
-
-    A pass in flight is fast and straight. When someone stops it, heads it or redirects it,
-    the ball slows down or turns within a few frames. This is what showed us the 0:07
-    interception when the distances to the players did not.
-    """
+    """Frames where the ball suddenly turns or changes speed: someone probably touched it."""
     k = TOUCH_WINDOW_FRAMES
     n = len(ball)
     candidate = np.zeros(n, dtype=bool)
@@ -461,7 +402,6 @@ def touch_frames(ball):
     hit = (moving & (turn > TOUCH_TURN_DEG)) | (speed_change > TOUCH_SPEED_CHANGE_MS)
     candidate[k:-k] = np.nan_to_num(hit, nan=0).astype(bool)
 
-    # One touch per burst of candidate frames: keep the middle frame.
     return [(start + stop - 1) // 2 for start, stop in runs(candidate)]
 
 
@@ -478,13 +418,7 @@ def ball_off_pitch(ball, pitch):
 
 
 def possession_evidence(ball, home_dist, away_dist, ball_speed=None):
-    """Per frame: positive favours home, negative favours away, 0 = no evidence.
-
-    Only counts when the ball is seen and someone is within CONTROL_RADIUS_M, and grows with how
-    much closer one team is than the other. A loose or contested ball gives no evidence, and
-    neither does a ball flying faster than anyone can run with it (version 3): in both cases
-    the decoder keeps the current team, the challenge's own rule for loose balls.
-    """
+    """Per frame: positive favours home, negative favours away, 0 = no evidence."""
     known = ~np.isnan(ball[:, 0])
     nearest = np.fmin(home_dist, away_dist)
     diff = away_dist - home_dist
@@ -497,11 +431,7 @@ def possession_evidence(ball, home_dist, away_dist, ball_speed=None):
 
 
 def viterbi_two_teams(evidence, start_team):
-    """Most likely H/A sequence for one stretch of live play.
-
-    Each frame scores +e/2 for home and -e/2 for away; every change of team costs SWITCH_COST.
-    Starting with the team that did not take the restart costs the same as one change.
-    """
+    """Most likely H/A sequence for one stretch of live play."""
     n = len(evidence)
     gain = np.stack([evidence / 2.0, -evidence / 2.0], axis=1)        # (n, 2): home, away
     score = gain[0].copy()
@@ -520,14 +450,8 @@ def viterbi_two_teams(evidence, start_team):
     return path                                                         # 0 = home, 1 = away
 
 
-def label_half(ball, players, team_of_track, pitch=None):
-    """Labels H / A / D for every frame of one half (arrays already cut to that half).
-
-    Each half is labelled on its own so nothing runs across halftime. The second half's scored
-    frames start almost two minutes before its kickoff. Those frames are all dead ball: the
-    walking rule catches them once players are out and standing, and the few-players rule
-    (version 3) catches them while the teams are still coming back out of the tunnel.
-    """
+def label_half(ball, players, team_of_track, pitch=None, votes=None):
+    """Labels H / A / D for every frame of one half (arrays already cut to that half)."""
     n = len(ball)
     labels = np.full(n, "D", dtype="<U1")
 
@@ -545,25 +469,36 @@ def label_half(ball, players, team_of_track, pitch=None):
 
     current = NOBODY
     n_switches = 0
-    n_restarts, n_by_kicker = 0, 0
+    n_restarts, n_by_kicker, n_by_tags = 0, 0, 0
+    use_tags = TAG_RESTART and votes is not None
     for start, stop in runs(~dead):
         n_restarts += 1
-        # Rule 3: the restarting team is the team of the player nearest the ball when it is
-        # played. Opponents have to stand back at set pieces, so that player is the taker.
-        taker = restart_taker(start, stop, ball, ball_v, ball_speed, players, team_of_track)
+        taker, from_tags = NOBODY, False
+
+        if use_tags and not TAG_FILL_ONLY:
+            taker = restart_team_from_tags(start, stop, votes)
+            from_tags = taker != NOBODY
+
+        if taker == NOBODY:
+            taker = restart_taker(start, stop, ball, ball_v, ball_speed, players, team_of_track)
+
+        if taker == NOBODY and use_tags and TAG_FILL_ONLY:
+            taker = restart_team_from_tags(start, stop, votes)
+            from_tags = taker != NOBODY
+
+        if from_tags:
+            n_by_tags += 1
         if taker != NOBODY:
             current = taker
-            n_by_kicker += 1
+            if not from_tags:
+                n_by_kicker += 1
             window, known = None, []
         else:
-            # Could not see the kick (ball missing): fall back to the team most often near
-            # the ball in the first seconds of play.
             window = near[start:min(stop, start + RESTART_SEARCH_FRAMES)]
             known = window[window != NOBODY]
         if len(known):
             current = HOME if np.sum(known == HOME) >= np.sum(known == AWAY) else AWAY
         elif current == NOBODY:
-            # Nobody clearly near: fall back to whichever team is nearest at all.
             h, a = home_dist[start:stop], away_dist[start:stop]
             both = ~np.isnan(h) & ~np.isnan(a)
             if both.any():
@@ -581,10 +516,6 @@ def label_half(ball, players, team_of_track, pitch=None):
         streak_team, streak_start, streak_len = NOBODY, None, 0
         frame = start
         while frame < stop:
-            # A touch by the other team switches possession, as long as that team then stays
-            # near the ball for a few frames. Without that check, a defender pressing the
-            # carrier (like the two Athletic players around the Barcelona player at 0:08)
-            # would steal possession on every dribble touch.
             if frame in touches and touch_team[frame] not in (NOBODY, current):
                 toucher = int(touch_team[frame])
                 after = near[frame:min(stop, frame + TOUCH_CONFIRM_WINDOW)]
@@ -593,9 +524,6 @@ def label_half(ball, players, team_of_track, pitch=None):
                     n_switches += 1
                     streak_team, streak_len = NOBODY, 0
 
-            # Otherwise, the other team has to stay near the ball for SWITCH_FRAMES frames. A
-            # near miss does not count: at about 0:16 a Barcelona player almost cut out Athletic's
-            # long pass but fell, and the answer key stayed with Athletic.
             who = near[frame]
             if who != NOBODY and who != current:
                 if who != streak_team:
@@ -604,37 +532,26 @@ def label_half(ball, players, team_of_track, pitch=None):
                 if streak_len >= SWITCH_FRAMES:
                     current = int(who)
                     n_switches += 1
-                    # Back-date the switch to when the streak began.
                     labels[streak_start:frame] = "H" if current == HOME else "A"
                     streak_team, streak_len = NOBODY, 0
             elif who == current:
                 streak_team, streak_len = NOBODY, 0
-            # who == NOBODY (ball missing or nobody close): keep the current team and pause the
-            # streak. When Barcelona's goalkeeper held the ball from 0:18 to 0:24, nothing was
-            # moving, but play was live and it stayed Barcelona's ball.
 
             labels[frame] = "H" if current == HOME else "A"
             frame += 1
 
+    merged = 0
+    if MERGE_STOPPAGES and pitch is not None:
+        labels, merged = merge_false_stoppages(labels, ball, ball_speed, pitch)
+
     return labels, {"static_blocks": n_static, "touches": len(touches), "switches": n_switches,
                     "dead_frames": int(dead.sum()), "restarts": n_restarts,
-                    "restarts_by_kicker": n_by_kicker}
+                    "restarts_by_kicker": n_by_kicker, "restarts_by_tags": n_by_tags,
+                    "merged": merged}
 
 
 def restart_taker(start, stop, ball, ball_v, ball_speed, players, team_of_track):
-    """Team of the player who restarts play, or NOBODY if the kick can't be found.
-
-    Finds the moments around the restart where a ball that was still (or just placed) starts
-    moving. During a stoppage the ball is often thrown or passed to the taker first (like the
-    ball handed back at 3:09), and that also looks like "still, then moving". So we take the
-    last such moment up to one second into play, which is the actual restart, and only look
-    further into play if there was none.
-
-    The ball is often missing from the tracking during a stoppage and only reappears once it
-    is already moving. Then we work backwards: we take where it reappeared and its direction
-    and speed, and step back along that line by the time it was out of sight (at most one
-    second) to estimate where it was kicked from. The taker is the player nearest that spot.
-    """
+    """Team of the player who restarts play, or NOBODY if the kick can't be found."""
     low = max(1, start - RESTART_LOOKBACK_FRAMES)
     high = min(stop, start + RESTART_SEARCH_FRAMES)
     kicks = []
@@ -655,10 +572,8 @@ def restart_taker(start, stop, ball, ball_v, ball_speed, players, team_of_track)
     radius = KICK_RADIUS_M
 
     if not np.isnan(ball[moment, 0]):
-        # We can see the ball just before it was played.
         point, when = ball[moment], moment
     else:
-        # The ball reappeared already moving: step back along its path.
         seen = np.flatnonzero(~np.isnan(ball[moment:kick + 1, 0]))
         if not len(seen):
             return NOBODY
@@ -675,6 +590,51 @@ def restart_taker(start, stop, ball, ball_v, ball_speed, players, team_of_track)
     if np.all(np.isnan(distance)) or np.nanmin(distance) > radius:
         return NOBODY
     return HOME if team_of_track[int(np.nanargmin(distance))] == HOME else AWAY
+
+
+def merge_false_stoppages(labels, ball, ball_speed, pitch):
+    """Turn a stoppage back into play where the ball was clearly being played through it.
+
+    The dead-ball rule never looks at the ball, so a slow passage of play -- the back four
+    passing sideways with nobody pressing -- looks exactly like a whistle: almost everyone is
+    strolling. 87 of our 145 stoppages have no set piece anywhere near them, where a real match
+    has perhaps 25, and a stoppage invented inside a real possession is the most expensive
+    mistake available: it destroys that possession and manufactures two more.
+
+    This runs last, on the finished labels, and can only ever turn a D into a team. Everything
+    step 6 decided is frozen. Three separate guards have to agree before a stoppage is rubbed
+    out:
+
+      * the SAME team has the ball immediately before and after it. A real stoppage usually
+        changes hands -- a throw-in, a foul won -- so one that does is left alone. One that does
+        not is a possession we may have cut in half.
+      * the ball never clearly crossed a line during it. That stoppage is not our inference, it
+        is the laws of the game: the ball is dead the moment it wholly crosses. A hunch about
+        ball speed has no business overruling it, and this is the guard that keeps the quick
+        throw-ins we already get right.
+      * the ball is visible, inside the lines and being played for more than half of it. A real
+        stoppage does have the ball moving sometimes -- rolled back to the taker, bouncing away
+        after going out -- but in bursts, not throughout.
+    """
+    off = ball_off_pitch(ball, pitch)
+    with np.errstate(invalid="ignore"):
+        moving = ball_speed > KICK_SPEED_MS
+    busy = (~np.isnan(ball[:, 0])) & (~off) & moving
+
+    merged = 0
+    for start, stop in runs(labels == "D"):
+        if start == 0 or stop >= len(labels):
+            continue                            # at the edge of the half: no team on both sides
+        before, after = labels[start - 1], labels[stop]
+        if before not in ("H", "A") or before != after:
+            continue                            # changes hands, or unknown: leave it alone
+        if off[start:stop].any():
+            continue                            # the ball crossed a line: dead by the laws
+        if np.mean(busy[start:stop]) <= BALL_BUSY_FRACTION:
+            continue                            # the ball was not being played through it
+        labels[start:stop] = before
+        merged += 1
+    return labels, merged
 
 
 def count_possessions(labels):
@@ -700,25 +660,40 @@ def build(game=GAME, data_dir=None):
     ball, players = load_tracking(raw_path, n_frames, len(team_of_track), GAMES[game]["pitch"])
     print("  ball located on {:.1f}% of frames\n".format(100.0 * np.mean(~np.isnan(ball[:, 0]))))
 
-    # Frames outside the two halves are never scored: X there.
+    votes = None
+    if TAG_RESTART:
+        votes, tag_stats = phase_possession_votes(n_frames, home, away, game, data_dir)
+        covered = 100.0 * np.mean(votes.sum(axis=1) > 0)
+        print("Smart Tagging: {} phases used, {} set-piece tags left for check_output.py, "
+              "{} with no usable Team".format(tag_stats["used"], tag_stats["reserved"],
+                                              tag_stats["no_team"]))
+        if tag_stats["unknown_codes"]:
+            print("  codes we do not recognise, skipped: {}".format(
+                ", ".join("{} ({})".format(code, n)
+                          for code, n in sorted(tag_stats["unknown_codes"].items()))))
+        print("  they say who has the ball on {:.1f}% of all frames\n".format(covered))
+
     labels = np.full(n_frames, "X", dtype="<U1")
     for half, first, last in half_video_blocks(game):
         stop = last + 1
         half_labels, stats = label_half(ball[first:stop], players[first:stop], team_of_track,
-                                        GAMES[game]["pitch"])
+                                        GAMES[game]["pitch"],
+                                        votes[first:stop] if votes is not None else None)
         labels[first:stop] = half_labels
-        print("half {}: H {:>6}  A {:>6}  D {:>6}   possessions {:>4}   touches {:>5}   "
-              "fake-dot blocks removed {}   restarts {} (taker seen in {})".format(
+        print("half {}: H {:>6}  A {:>6}  D {:>6}   possessions {:>4}   "
+              "restarts {} (from the tags {}, from the dots {}, guessed {})".format(
                   half, int(np.sum(half_labels == "H")), int(np.sum(half_labels == "A")),
                   int(np.sum(half_labels == "D")), count_possessions(half_labels),
-                  stats["touches"], stats["static_blocks"], stats["restarts"],
-                  stats["restarts_by_kicker"]))
+                  stats["restarts"], stats["restarts_by_tags"], stats["restarts_by_kicker"],
+                  stats["restarts"] - stats["restarts_by_tags"] - stats["restarts_by_kicker"]))
+        print("        stoppages rubbed out because the ball was being played through them: {}"
+              .format(stats["merged"]))
     return labels
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--name", default="our_team", help="output file name, without .csv")
+    parser.add_argument("--name", default="TactiQ", help="output file name, without .csv")
     parser.add_argument("--out", default=RESULTS_DIR, help="folder to write into")
     parser.add_argument("--dead-fraction", type=float, default=DEAD_FRACTION,
                         help="share of players walking that means a dead ball")
@@ -742,12 +717,27 @@ if __name__ == "__main__":
                         help="version 2 behaviour: few tracked players does not mean dead ball")
     parser.add_argument("--no-out-dead", action="store_true",
                         help="version 2 behaviour: ball out of pitch subject to the 5 s minimum")
+    parser.add_argument("--no-merge-stoppages", action="store_true",
+                        help="do not rub out stoppages the ball was clearly played through")
+    parser.add_argument("--busy-fraction", type=float, default=BALL_BUSY_FRACTION,
+                        help="share of a stoppage the ball must be in play through to rub it out")
+    parser.add_argument("--no-tag-restart", action="store_true",
+                        help="version 3 behaviour: work the restarting team out from the dots only")
+    parser.add_argument("--tag-fill-only", action="store_true",
+                        help="use the dots first and the tags only where the kick was not found")
+    parser.add_argument("--tag-window", type=int, default=TAG_WINDOW_FRAMES,
+                        help="frames of play after a restart the phases vote over (25 = 1 second)")
     args = parser.parse_args()
 
     MIN_DEAD_FRAMES = args.min_dead
     FAST_BALL_RULE = not args.no_fast_ball
     FEW_PLAYERS_DEAD = not args.no_few_dead
     OUT_DEAD_RULE = not args.no_out_dead
+    MERGE_STOPPAGES = not args.no_merge_stoppages
+    BALL_BUSY_FRACTION = args.busy_fraction
+    TAG_RESTART = not args.no_tag_restart
+    TAG_FILL_ONLY = args.tag_fill_only
+    TAG_WINDOW_FRAMES = args.tag_window
     DECODER = args.decoder
     SWITCH_COST = args.switch_cost
     MIN_ALIVE_GAP_FRAMES = args.min_alive_gap
